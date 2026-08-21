@@ -32,7 +32,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-APP_VERSION = "15.16-fast-task-owner-map"
+APP_VERSION = "15.18-management-mis"
 
 st.set_page_config(
     page_title="E-Commerce Reconciliation Control Tower",
@@ -5465,10 +5465,70 @@ def show_completion_notice():
         st.info(message)
 
 # ============================================================
+# MANAGEMENT MIS / ANALYTICS
+# ============================================================
+def _normalized_branch(series):
+    s = series.fillna("").astype(str).str.strip()
+    return s.where(s.ne(""), "Unassigned")
+
+
+def _exception_category(remark):
+    r = txt(remark).lower()
+    if not r or r.startswith("reconciled"):
+        return "Reconciled / No Exception"
+    mapping = [
+        ("partial tei", "Partial TEI / Balance Pending"),
+        ("tei", "TEI Pending"),
+        ("cn", "CN Pending"),
+        ("short payment", "Short Payment"),
+        ("payment", "Payment Pending"),
+        ("billing", "Billing Pending"),
+        ("refund", "Refund Review"),
+        ("replacement", "Replacement Review"),
+        ("mir", "MIR Pending"),
+    ]
+    for key, label in mapping:
+        if key in r:
+            return label
+    return "Other Review"
+
+
+def management_mis_frames(master, tasks):
+    master = master.copy()
+    tasks = tasks.copy()
+    if not master.empty:
+        master["__branch__"] = _normalized_branch(master.get("branch_code", pd.Series("", index=master.index)))
+        master["__portal__"] = master.get("portal", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+        remark_s = master.get("pending_remarks", pd.Series("", index=master.index)).fillna("").astype(str).str.strip()
+        ex_map = {v: _exception_category(v) for v in remark_s.drop_duplicates().tolist()}
+        master["__exception__"] = remark_s.map(ex_map).fillna("Other Review")
+        master["__reconciled__"] = (remark_s.str.lower().str.startswith("reconciled") | master.get("transaction_status", pd.Series("", index=master.index)).fillna("").astype(str).str.strip().str.lower().eq("reconciled"))
+        master["__has_return__"] = pd.to_numeric(master.get("courier_customer_return_qty", 0), errors="coerce").fillna(0).abs().gt(0)
+    if not tasks.empty:
+        tasks["__branch__"] = _normalized_branch(tasks.get("branch_code", pd.Series("", index=tasks.index)))
+        tasks["__portal__"] = tasks.get("portal", pd.Series("", index=tasks.index)).fillna("").astype(str).str.strip()
+        tasks["__status__"] = tasks.get("task_status", pd.Series("", index=tasks.index)).fillna("").astype(str).str.strip()
+        tasks["__aging__"] = pd.to_numeric(tasks.get("aging_days", 0), errors="coerce").fillna(0).clip(lower=0)
+    return master, tasks
+
+
+def _mis_filter_frames(master, tasks, portals=None, branches=None):
+    portals = set(portals or [])
+    branches = set(branches or [])
+    m, t = master, tasks
+    if portals:
+        if not m.empty: m = m[m["__portal__"].isin(portals)]
+        if not t.empty: t = t[t["__portal__"].isin(portals)]
+    if branches:
+        if not m.empty: m = m[m["__branch__"].isin(branches)]
+        if not t.empty: t = t[t["__branch__"].isin(branches)]
+    return m.copy(), t.copy()
+
+# ============================================================
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.16 — Fast Task/Owner Mapping + Instant Dashboard")
+st.caption("Build: v15.18 — Management MIS + Branch/SLA/Exception Analytics")
 show_completion_notice()
 
 # v15.14 lightweight startup diagnostic. This performs only COUNT queries and
@@ -5528,6 +5588,7 @@ workspace = st.radio(
     "Workspace",
     [
         "E-Com Reconciliation Dashboard",
+        "Management MIS",
         "Settlement Dashboard",
         "Pending Task Dashboard",
         "All Branch Pending Task Update",
@@ -5920,6 +5981,119 @@ if workspace == "E-Com Reconciliation Dashboard":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
+
+elif workspace == "Management MIS":
+    st.subheader("Management MIS & Exception Control")
+    st.caption("Executive view of reconciliation health, branch performance, task SLA and exceptions from the same persistent Supabase data.")
+
+    master_mis, tasks_mis = management_mis_frames(load_master(), load_tasks())
+    if master_mis.empty:
+        st.info("No reconciliation data stored yet.")
+        st.stop()
+
+    f1, f2, f3 = st.columns([1.1, 1.4, 0.8])
+    portal_options = sorted([x for x in master_mis["__portal__"].dropna().unique().tolist() if x])
+    branch_options = sorted(master_mis["__branch__"].dropna().unique().tolist())
+    selected_portals = f1.multiselect("Marketplace", portal_options, default=portal_options, key="mis_marketplace")
+    selected_branches = f2.multiselect("Branch", branch_options, default=[], placeholder="All branches", key="mis_branch")
+    sla_days = f3.number_input("Task SLA (Days)", min_value=1, max_value=60, value=5, step=1, key="mis_sla_days")
+
+    mf, tf = _mis_filter_frames(master_mis, tasks_mis, selected_portals, selected_branches)
+    open_tasks = tf[tf["__status__"].isin(["Pending", "Working"])].copy() if not tf.empty else tf
+    overdue_tasks = open_tasks[open_tasks["__aging__"] > sla_days].copy() if not open_tasks.empty else open_tasks
+    completed_tasks = tf[tf["__status__"].eq("Completed")].copy() if not tf.empty else tf
+
+    tab_exec, tab_branch, tab_sla, tab_ex = st.tabs(["Executive MIS", "Branch Performance", "Aging & SLA", "Exception Analytics"])
+
+    with tab_exec:
+        total_orders = int(mf["order_no"].nunique())
+        reconciled_orders = int(mf.loc[mf["__reconciled__"], "order_no"].nunique()) if total_orders else 0
+        reconciliation_rate = reconciled_orders / total_orders * 100 if total_orders else 0
+        return_orders = int(mf.loc[mf["__has_return__"], "order_no"].nunique()) if total_orders else 0
+        return_rate = return_orders / total_orders * 100 if total_orders else 0
+        order_value = pd.to_numeric(mf.get("order_price", 0), errors="coerce").fillna(0).sum()
+        received = pd.to_numeric(mf.get("net_pay_received", 0), errors="coerce").fillna(0).sum()
+        refunds = pd.to_numeric(mf.get("refund", 0), errors="coerce").fillna(0).sum()
+        deferred = pd.to_numeric(mf.get("deferred_amount", 0), errors="coerce").fillna(0).sum()
+        c1,c2,c3,c4,c5,c6 = st.columns(6)
+        c1.metric("Total Orders", f"{total_orders:,}")
+        c2.metric("Reconciliation Rate", f"{reconciliation_rate:.1f}%")
+        c3.metric("Open Tasks", f"{len(open_tasks):,}")
+        c4.metric("Overdue > SLA", f"{len(overdue_tasks):,}")
+        c5.metric("Return Rate", f"{return_rate:.1f}%")
+        c6.metric("Completed Tasks", f"{len(completed_tasks):,}")
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Order Value", f"₹{order_value:,.2f}")
+        m2.metric("Received Amount", f"₹{received:,.2f}")
+        m3.metric("Refund", f"₹{refunds:,.2f}")
+        m4.metric("Deferred Amount", f"₹{deferred:,.2f}")
+        st.markdown("#### Marketplace Health")
+        market = mf.groupby("__portal__", dropna=False).agg(Orders=("order_no","nunique"), Reconciled=("__reconciled__","sum"), Return_Orders=("__has_return__","sum")).reset_index().rename(columns={"__portal__":"Marketplace"})
+        market["Reconciliation %"] = (market["Reconciled"] / market["Orders"].replace(0,pd.NA) * 100).fillna(0).round(1)
+        if not tf.empty:
+            mt = tf.groupby("__portal__", dropna=False).agg(Total_Tasks=("order_no","size"), Open_Tasks=("__status__", lambda s: s.isin(["Pending","Working"]).sum())).reset_index().rename(columns={"__portal__":"Marketplace"})
+            market = market.merge(mt, on="Marketplace", how="left")
+        st.dataframe(market.fillna(0), use_container_width=True, hide_index=True)
+        exc = mf.loc[~mf["__reconciled__"], "__exception__"].value_counts().rename_axis("Exception").to_frame("Orders")
+        if not exc.empty:
+            st.markdown("#### Top Open Exceptions")
+            st.bar_chart(exc.head(10))
+
+    with tab_branch:
+        st.markdown("#### Branch Performance Scorecard")
+        branch = mf.groupby("__branch__", dropna=False).agg(Orders=("order_no","nunique"), Reconciled=("__reconciled__","sum"), Return_Orders=("__has_return__","sum"), Order_Value=("order_price","sum"), Received=("net_pay_received","sum")).reset_index().rename(columns={"__branch__":"Branch"})
+        branch["Reconciliation %"] = (branch["Reconciled"] / branch["Orders"].replace(0,pd.NA) * 100).fillna(0)
+        branch["Return %"] = (branch["Return_Orders"] / branch["Orders"].replace(0,pd.NA) * 100).fillna(0)
+        if not tf.empty:
+            bt = tf.groupby("__branch__", dropna=False).agg(Total_Tasks=("order_no","size"), Open_Tasks=("__status__", lambda s: s.isin(["Pending","Working"]).sum()), Completed_Tasks=("__status__", lambda s: s.eq("Completed").sum()), Avg_Aging_Days=("__aging__","mean")).reset_index().rename(columns={"__branch__":"Branch"})
+            ob = overdue_tasks.groupby("__branch__").size().rename("Overdue_Tasks").reset_index().rename(columns={"__branch__":"Branch"}) if not overdue_tasks.empty else pd.DataFrame(columns=["Branch","Overdue_Tasks"])
+            branch = branch.merge(bt.merge(ob,on="Branch",how="left"), on="Branch", how="left")
+        for col in ["Total_Tasks","Open_Tasks","Completed_Tasks","Overdue_Tasks","Avg_Aging_Days"]:
+            if col not in branch.columns: branch[col] = 0
+        branch["Task Completion %"] = (branch["Completed_Tasks"] / branch["Total_Tasks"].replace(0,pd.NA) * 100).fillna(0)
+        branch["SLA Compliance %"] = ((branch["Open_Tasks"]-branch["Overdue_Tasks"]).clip(lower=0) / branch["Open_Tasks"].replace(0,pd.NA) * 100).fillna(100)
+        cols=["Branch","Orders","Reconciliation %","Return %","Open_Tasks","Overdue_Tasks","Completed_Tasks","Task Completion %","SLA Compliance %","Avg_Aging_Days","Order_Value","Received"]
+        branch=branch.sort_values(["Overdue_Tasks","Open_Tasks","Orders"],ascending=[False,False,False])
+        st.dataframe(branch[cols].round(2), use_container_width=True, hide_index=True)
+        st.markdown("#### Branch Open vs Overdue Tasks")
+        st.bar_chart(branch.set_index("Branch")[["Open_Tasks","Overdue_Tasks"]])
+
+    with tab_sla:
+        st.markdown(f"#### Open Task SLA — Target: {int(sla_days)} Days")
+        if tf.empty:
+            st.info("No task data available.")
+        else:
+            active=tf[tf["__status__"].isin(["Pending","Working"])].copy()
+            labels=["0–2 Days","3–5 Days","6–10 Days","11–20 Days","21+ Days"]
+            active["Aging Bucket"] = pd.cut(active["__aging__"], bins=[-1,2,5,10,20,10**9], labels=labels)
+            aging=active["Aging Bucket"].value_counts(sort=False).reindex(labels,fill_value=0).rename_axis("Aging Bucket").to_frame("Open Tasks")
+            st.bar_chart(aging)
+            s1,s2,s3,s4=st.columns(4)
+            within=max(len(active)-len(overdue_tasks),0)
+            compliance=within/len(active)*100 if len(active) else 100
+            s1.metric("Open Tasks",f"{len(active):,}")
+            s2.metric("Within SLA",f"{within:,}")
+            s3.metric("Overdue",f"{len(overdue_tasks):,}")
+            s4.metric("SLA Compliance",f"{compliance:.1f}%")
+            if not overdue_tasks.empty:
+                show=overdue_tasks[[c for c in ["__portal__","__branch__","order_no","task_type","__status__","__aging__","task_assign_to","task_assign_email","team_remarks"] if c in overdue_tasks.columns]].copy().rename(columns={"__portal__":"Marketplace","__branch__":"Branch","order_no":"Order No","task_type":"Task Type","__status__":"Task Status","__aging__":"Aging Days","task_assign_to":"Task Assign To","task_assign_email":"Owner Email","team_remarks":"Team Remarks"})
+                st.dataframe(show.sort_values("Aging Days",ascending=False), use_container_width=True, hide_index=True)
+
+    with tab_ex:
+        open_ex=mf[~mf["__reconciled__"]].copy()
+        st.markdown("#### Exception Mix")
+        exs=open_ex.groupby("__exception__",dropna=False).agg(Orders=("order_no","nunique"),Order_Value=("order_price","sum"),Received=("net_pay_received","sum"),Return_Qty=("courier_customer_return_qty","sum")).reset_index().rename(columns={"__exception__":"Exception"}).sort_values("Orders",ascending=False)
+        st.dataframe(exs.round(2), use_container_width=True, hide_index=True)
+        x1,x2,x3,x4=st.columns(4)
+        x1.metric("Open Exception Orders",f"{open_ex['order_no'].nunique():,}")
+        x2.metric("Payment-related",f"{open_ex['__exception__'].isin(['Payment Pending','Short Payment']).sum():,}")
+        x3.metric("Return/TEI/CN-related",f"{open_ex['__exception__'].isin(['TEI Pending','Partial TEI / Balance Pending','CN Pending','MIR Pending']).sum():,}")
+        x4.metric("Billing-related",f"{open_ex['__exception__'].eq('Billing Pending').sum():,}")
+        st.markdown("#### High-Value Exception Orders")
+        high=open_ex.copy(); high["__value__"]=pd.to_numeric(high.get("order_price",0),errors="coerce").fillna(0)
+        cols=["__portal__","__branch__","order_no","order_item","__exception__","pending_remarks","payment_status","__value__","net_pay_received","refund","courier_customer_return_qty","return_completed_date"]
+        show=high[[c for c in cols if c in high.columns]].rename(columns={"__portal__":"Marketplace","__branch__":"Branch","order_no":"Order No","order_item":"Order Item","__exception__":"Exception","pending_remarks":"Pending Remarks","payment_status":"Payment Status","__value__":"Order Value","net_pay_received":"Rece Amount","refund":"Refund","courier_customer_return_qty":"Return Qty","return_completed_date":"Return Delivery Date"})
+        st.dataframe(show.sort_values("Order Value",ascending=False).head(200), use_container_width=True, hide_index=True)
 
 elif workspace == "Settlement Dashboard":
     st.subheader("Settlement Dashboard")
