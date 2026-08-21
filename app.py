@@ -32,7 +32,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-APP_VERSION = "15.15-instant-dashboard-render"
+APP_VERSION = "15.16-fast-task-owner-map"
 
 st.set_page_config(
     page_title="E-Commerce Reconciliation Control Tower",
@@ -2595,6 +2595,7 @@ def process_workbook(path, portal, progress=None):
 # ============================================================
 # OWNER MASTER
 # ============================================================
+@st.cache_data(ttl=60, show_spinner=False)
 def load_owner_rules():
     with db() as c:
         return pd.read_sql_query("""
@@ -2632,6 +2633,7 @@ def save_owner_rules(df):
             count += 1
         c.commit()
 
+    invalidate_read_cache()
     return count
 
 def get_assignees(branch, task_type):
@@ -3097,42 +3099,84 @@ def upsert_reconciliation(frame, source_file, record_upload=True):
 # ============================================================
 # TASK / MIR DATA
 # ============================================================
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_tasks():
+    """
+    v15.16 fast task loader.
+
+    Pending tasks and branch-owner rules are fetched once each. Owner assignment
+    is mapped in memory instead of calling Supabase once per task row.
+    """
     with db() as c:
-        t = pd.read_sql_query("""
-            SELECT * FROM pending_tasks
+        t = pd.read_sql_query("SELECT * FROM pending_tasks", c)
+        rules = pd.read_sql_query("""
+            SELECT branch_code, task_type, owner_name, owner_email
+            FROM branch_owner_rules
         """, c)
 
     if t.empty:
         return t
 
+    # Dates + aging are fully vectorized.
     for col in ["task_created_date","working_date","task_completed_date","last_update"]:
-        t[col] = pd.to_datetime(t[col], errors="coerce")
+        if col in t.columns:
+            t[col] = pd.to_datetime(t[col], errors="coerce")
 
-    today = pd.Timestamp(date.today())
+    today = pd.Timestamp(date.today()).normalize()
+    start = t["task_created_date"].dt.normalize()
+    completed_mask = (
+        t["task_status"].fillna("").astype(str).str.strip().eq("Completed")
+        & t["task_completed_date"].notna()
+    )
+    end = pd.Series(today, index=t.index, dtype="datetime64[ns]")
+    end.loc[completed_mask] = t.loc[
+        completed_mask, "task_completed_date"
+    ].dt.normalize()
+    t["aging_days"] = (end - start).dt.days.fillna(0).clip(lower=0).astype(int)
 
-    def aging(r):
-        start = r["task_created_date"]
-        if pd.isna(start):
-            return 0
-        if txt(r["task_status"]) == "Completed" and pd.notna(r["task_completed_date"]):
-            end = r["task_completed_date"]
-        else:
-            end = today
-        return max((end.normalize()-start.normalize()).days,0)
+    # Owner assignment: one rules query + in-memory lookup.
+    t["task_assign_to"] = ""
+    t["task_assign_email"] = ""
 
-    t["aging_days"] = t.apply(aging, axis=1)
+    if not rules.empty:
+        for col in ["branch_code","task_type","owner_name","owner_email"]:
+            rules[col] = rules[col].fillna("").astype(str).str.strip()
 
-    assignees = []
-    emails = []
-    for _, r in t.iterrows():
-        names, mails = get_assignees(r["branch_code"], r["task_type"])
-        assignees.append(names)
-        emails.append(mails)
+        def join_unique_values(series):
+            vals = [v for v in series.tolist() if v]
+            return "; ".join(dict.fromkeys(vals))
 
-    t["task_assign_to"] = assignees
-    t["task_assign_email"] = emails
+        exact = (
+            rules.groupby(["branch_code","task_type"], sort=False, as_index=False)
+            .agg({
+                "owner_name": join_unique_values,
+                "owner_email": join_unique_values,
+            })
+        )
+        exact_map = {
+            (r.branch_code, r.task_type): (r.owner_name, r.owner_email)
+            for r in exact.itertuples(index=False)
+        }
+
+        all_branch = exact[
+            exact["branch_code"].str.lower().eq("all branch")
+        ]
+        fallback_map = {
+            r.task_type: (r.owner_name, r.owner_email)
+            for r in all_branch.itertuples(index=False)
+        }
+
+        task_branch = t["branch_code"].fillna("").astype(str).str.strip()
+        task_type = t["task_type"].fillna("").astype(str).str.strip()
+
+        assignments = [
+            exact_map.get((branch, typ), fallback_map.get(typ, ("", "")))
+            for branch, typ in zip(task_branch.tolist(), task_type.tolist())
+        ]
+        if assignments:
+            t["task_assign_to"] = [x[0] for x in assignments]
+            t["task_assign_email"] = [x[1] for x in assignments]
+
     return t
 
 def update_task(portal, order_no, task_type, status, team_remarks="", working_date=None, completed_date=None):
@@ -5424,7 +5468,7 @@ def show_completion_notice():
 # UI
 # ============================================================
 st.title("E-Commerce Reconciliation Control Tower")
-st.caption("Build: v15.15 — Instant Dashboard Render + Persistent Business Rules")
+st.caption("Build: v15.16 — Fast Task/Owner Mapping + Instant Dashboard")
 show_completion_notice()
 
 # v15.14 lightweight startup diagnostic. This performs only COUNT queries and
