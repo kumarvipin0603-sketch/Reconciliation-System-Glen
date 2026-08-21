@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Reconciliation Tower v11 — Persistent, Read-Only Main Reconciliation + Auditable Team Workflow
 
 This build uses the current Amazon and Flipkart reconciliation Python logic supplied with the source workbooks.
@@ -762,3 +763,7 @@ configured.
 problems including Python syntax errors, missing required project files, missing
 persistence guardrails and the earlier `log_activity(..., branch=...)` keyword
 mismatch.
+=======
+# Reconcilation_System_UPDATE_NOTES_v15.12
+Glen Appliances Pvt Ltd
+>>>>>>> 4ef9c0fda54f904909d1070f33cb4133df9c3e41
