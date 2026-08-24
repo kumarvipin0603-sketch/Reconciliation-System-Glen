@@ -12,7 +12,6 @@ from psycopg2.extras import execute_batch
 import shutil
 import tempfile
 import warnings
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import date, datetime
 from time import perf_counter, sleep
 from pathlib import Path
@@ -308,82 +307,37 @@ class _PgCursorCompat:
         self._cursor.close()
 
 
-def _postgres_url_candidate(url, port_override=None):
-    """Return a hardened PostgreSQL URI without ever logging credentials."""
-    try:
-        parts = urlsplit(str(url).strip())
-        host = parts.hostname or ""
-        port = int(port_override or parts.port or 5432)
-        user = parts.username or ""
-        password = parts.password or ""
-
-        # Preserve percent-escaped credentials from the original URI when possible.
-        netloc = ""
-        if user:
-            from urllib.parse import quote
-            netloc = quote(user, safe=".")
-            if password:
-                netloc += ":" + quote(password, safe="")
-            netloc += "@"
-        netloc += host
-        if port:
-            netloc += f":{port}"
-
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        query.setdefault("sslmode", "require")
-        query.setdefault("gssencmode", "disable")
-        query.setdefault("client_encoding", "UTF8")
-        return urlunsplit((parts.scheme or "postgresql", netloc, parts.path or "/postgres", urlencode(query), ""))
-    except Exception:
-        # If parsing ever fails, keep the user's supplied URI unchanged.
-        return str(url).strip()
-
-
-def _postgres_connection_candidates(url):
-    """Session pooler first; transaction pooler is a controlled fallback."""
-    candidates = [("configured", _postgres_url_candidate(url))]
-    try:
-        parts = urlsplit(str(url).strip())
-        host = (parts.hostname or "").lower()
-        port = parts.port or 5432
-        if host.endswith(".pooler.supabase.com") and int(port) == 5432:
-            candidates.append(("transaction-pooler-fallback", _postgres_url_candidate(url, 6543)))
-    except Exception:
-        pass
-    return candidates
-
-
 class PostgresCompat:
     """
-    DB-API compatibility layer for PostgreSQL/Supabase.
-
-    The configured Session Pooler is tried first. If Supabase's Session Pooler
-    is temporarily unable to route to the project database, the same Supavisor
-    host on transaction-pooler port 6543 is tried as a controlled fallback.
-    No automatic SQLite fallback is used while DATABASE_URL is configured, so
-    production data can never silently split across two databases.
+    Small DB-API compatibility layer so the existing reconciliation code can
+    keep using SQLite-style:
+        with db() as c:
+            c.execute(sql, params)
+    while production data is stored in PostgreSQL/Supabase.
     """
     def __init__(self, url):
+        # Remote PostgreSQL/Supabase can occasionally reject or time out a
+        # connection while Streamlit is waking/redeploying. Retry short-lived
+        # OperationalError failures instead of crashing the whole dashboard on
+        # the first attempt. Do NOT fall back to SQLite when DATABASE_URL is
+        # configured, because that would split production data.
         last_error = None
-        self.connection_mode = ""
-        for mode, candidate in _postgres_connection_candidates(url):
-            for attempt in range(2):
-                try:
-                    self.conn = psycopg2.connect(
-                        candidate,
-                        connect_timeout=20,
-                        application_name="glen_reconciliation_tower",
-                        keepalives=1,
-                        keepalives_idle=30,
-                        keepalives_interval=10,
-                        keepalives_count=3,
-                    )
-                    self.connection_mode = mode
-                    return
-                except psycopg2.OperationalError as exc:
-                    last_error = exc
-                    if attempt == 0:
-                        sleep(1.5)
+        for attempt in range(3):
+            try:
+                self.conn = psycopg2.connect(
+                    url,
+                    connect_timeout=15,
+                    application_name="glen_reconciliation_tower",
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=3,
+                )
+                return
+            except psycopg2.OperationalError as exc:
+                last_error = exc
+                if attempt < 2:
+                    sleep(1.5 * (attempt + 1))
         raise last_error
 
     def __enter__(self):
@@ -749,39 +703,7 @@ def init_db():
 
         c.commit()
 
-# Initialize the database without allowing a remote connection outage to dump a
-# full traceback in the browser. This is deliberately fail-closed: when a cloud
-# DATABASE_URL exists we do not silently switch to SQLite, because that could
-# split live reconciliation history across two stores.
-try:
-    init_db()
-except psycopg2.OperationalError as _startup_db_exc:
-    _msg = str(_startup_db_exc).lower()
-    st.error("Cloud database connection could not be established.")
-    if "nxdomain" in _msg:
-        st.warning(
-            "Supabase's connection pooler can be reached, but it is currently "
-            "unable to route to this project's database (NXDOMAIN). The app has "
-            "stopped safely and has not switched to a different database."
-        )
-    elif "client encoding" in _msg:
-        st.warning(
-            "The PostgreSQL handshake reached the pooler but did not complete. "
-            "This build already retries with SSL, UTF-8 client encoding and the "
-            "Supabase transaction-pooler port."
-        )
-    else:
-        st.warning(
-            "Check the configured DATABASE_URL, database password and Supabase "
-            "pooler availability. No reconciliation data has been deleted."
-        )
-    if st.button("Retry cloud database", type="primary"):
-        try:
-            init_db.clear()
-        except Exception:
-            pass
-        st.rerun()
-    st.stop()
+init_db()
 
 # Visible persistence diagnostic.
 if using_postgres():
@@ -5443,8 +5365,8 @@ def complete_tasks_for_reconciled_orders():
     return int(active_before or 0)
 
 
-# Do not mutate task workflow merely because the app was opened/restarted.
-# Completion/backfill maintenance runs only after an explicit source/team update.
+complete_tasks_for_reconciled_orders()
+
 
 @st.cache_resource(show_spinner=False)
 def backfill_missing_tasks_from_master():
@@ -6235,8 +6157,10 @@ elif workspace == "Settlement Dashboard":
     c1.metric("Total Orders",f"{filtered['Order No'].nunique():,}")
     c2.metric("Order Value",f"₹{safe_numeric(filtered, 'Order Price').sum():,.0f}")
     c3.metric("Sale Value",f"₹{safe_numeric(filtered, 'Sale Price').sum():,.0f}")
-    c4.metric("Return Value",f"₹{safe_numeric(filtered, 'Return Price').sum():,.0f}")
-    c5.metric("Rece Amount",f"₹{safe_numeric(filtered, 'Rece Amount').sum():,.0f}")
+    # Settlement KPI source fields must match the visible settlement columns.
+    # Return Value follows the marketplace Refund amount; Rece Amount follows Payment Received.
+    c4.metric("Return Value",f"₹{safe_numeric(filtered, 'Refund').sum():,.0f}")
+    c5.metric("Rece Amount",f"₹{safe_numeric(filtered, 'Payment Received').sum():,.0f}")
     c6.metric("Total Deductions",f"₹{safe_numeric(filtered, 'Total Deductions').sum():,.0f}")
     c7.metric("Reconciled",int((safe_text(filtered, "Transaction Status")=="Reconciled").sum()))
     c8.metric("Pending / Review",int((safe_text(filtered, "Transaction Status")!="Reconciled").sum()))
