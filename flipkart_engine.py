@@ -700,7 +700,89 @@ def process_returns(dataframe: pd.DataFrame) -> pd.DataFrame:
         required=False,
     )
 
+    # Flipkart Returns is a lifecycle/event sheet: the same return_id can appear
+    # first when the return is created/approved and later again when that SAME
+    # return is completed. Summing every row therefore double-counts one physical
+    # return. Count each unique return lifecycle once. If a completed row exists,
+    # it is the source of truth; otherwise keep one latest open lifecycle row so
+    # an in-progress return is still counted until completion.
+    return_id_column = find_column(
+        df,
+        ("return_id", "Return ID", "Return Id"),
+        required=False,
+    )
+    completion_date_column = find_column(
+        df,
+        ("return_completion_date", "Return Completion Date", "Return Completed Date"),
+        required=False,
+    )
+    order_item_column = find_column(
+        df,
+        ("Order item ID", "Order Item ID", "order_item_id"),
+        required=False,
+    )
+
     df["Flipkart Return Qty"] = to_number(df[quantity_column]).abs()
+
+    if completion_date_column:
+        df["__return_completion__"] = pd.to_datetime(
+            df[completion_date_column], errors="coerce"
+        )
+    else:
+        df["__return_completion__"] = pd.NaT
+
+    if approval_date_column:
+        df["__return_approval_sort__"] = pd.to_datetime(
+            df[approval_date_column], errors="coerce"
+        )
+    else:
+        df["__return_approval_sort__"] = pd.NaT
+
+    if created_date_column:
+        df["__return_created_sort__"] = pd.to_datetime(
+            df[created_date_column], errors="coerce"
+        )
+    else:
+        df["__return_created_sort__"] = pd.NaT
+
+    if return_id_column:
+        return_id_text = df[return_id_column].fillna("").astype(str).str.strip()
+        if order_item_column:
+            item_text = df[order_item_column].fillna("").astype(str).str.strip()
+        else:
+            item_text = pd.Series("", index=df.index)
+
+        # Primary key = PO + return_id (+ item where available). Blank return IDs
+        # are kept row-unique so unrelated source rows are never collapsed.
+        lifecycle_key = (
+            df["__po__"].astype(str) + "||" + return_id_text + "||" + item_text
+        )
+        blank_id = return_id_text.eq("")
+        lifecycle_key = lifecycle_key.where(
+            ~blank_id,
+            df["__po__"].astype(str) + "||__ROW__" + df.index.astype(str),
+        )
+        df["__return_lifecycle_key__"] = lifecycle_key
+
+        # Completed occurrence wins. For duplicate completed snapshots, keep the
+        # latest completion. For open-only snapshots, keep the latest approval /
+        # creation occurrence. This guarantees one quantity contribution per return.
+        df["__is_completed__"] = df["__return_completion__"].notna().astype(int)
+        df = (
+            df.sort_values(
+                [
+                    "__return_lifecycle_key__",
+                    "__is_completed__",
+                    "__return_completion__",
+                    "__return_approval_sort__",
+                    "__return_created_sort__",
+                ],
+                ascending=[True, True, True, True, True],
+                na_position="first",
+            )
+            .drop_duplicates("__return_lifecycle_key__", keep="last")
+            .copy()
+        )
 
     aggregations = {"Flipkart Return Qty": "sum"}
 
@@ -841,7 +923,13 @@ def process_payments(dataframe: pd.DataFrame) -> pd.DataFrame:
         df[payment_date_column] = pd.to_datetime(
             df[payment_date_column], errors="coerce"
         )
-        aggregations[payment_date_column] = "min"
+
+        # Payment Date = first actual positive settlement receipt only.
+        # Refund/reimbursement/adjustment rows must not supply this date.
+        df["__payment_received_date__"] = df[payment_date_column].where(
+            df["Bank Settlement Value"] > AMOUNT_TOLERANCE
+        )
+        aggregations["__payment_received_date__"] = "min"
 
         # Refund Date is the payment date attached to a non-zero refund row.
         df["__refund_date__"] = df[payment_date_column].where(
@@ -858,7 +946,7 @@ def process_payments(dataframe: pd.DataFrame) -> pd.DataFrame:
     if payment_date_column:
         output = output.rename(
             columns={
-                payment_date_column: "Payment Date",
+                "__payment_received_date__": "Payment Date",
                 "__refund_date__": "Refund Date",
             }
         )
@@ -943,6 +1031,7 @@ def determine_remark(row: pd.Series) -> str:
     net_order_qty = number("Net Order Qty")
     order_qty = number("Order Qty")
     sales_report_qty = number("Sales Report Qty")
+    order_qty_or_sales = number("Order Qty or Sales")
 
     billed_qty = number("ERP Billed Qty")
     cn_qty = number("ERP CN Qty")
@@ -1028,6 +1117,21 @@ def determine_remark(row: pd.Series) -> str:
     # ------------------------------------------------------
     # 3. RECONCILED
     # ------------------------------------------------------
+    # v15.20 partial-return paid-balance closure:
+    # Example: Order Qty 2, Return Qty 1, full billing exists, refund exists for
+    # the returned piece and a positive net receipt exists for the balance piece.
+    # This is a financially closed split order and must not remain CN Pending.
+    source_order_qty = order_qty_or_sales if order_qty_or_sales > QUANTITY_TOLERANCE else max(order_qty, net_order_qty + return_qty)
+    if (
+        source_order_qty > 1.0 + QUANTITY_TOLERANCE
+        and return_qty > QUANTITY_TOLERANCE
+        and return_qty + QUANTITY_TOLERANCE < source_order_qty
+        and billed_qty + QUANTITY_TOLERANCE >= source_order_qty
+        and received_amount > AMOUNT_TOLERANCE
+        and abs(refund_amount) > AMOUNT_TOLERANCE
+    ):
+        return "Reconciled"
+
     # Once billing/payment-pending scenarios are excluded, no open ERP
     # quantity means the order is reconciled.
     if abs(net_erp_qty) <= QUANTITY_TOLERANCE:

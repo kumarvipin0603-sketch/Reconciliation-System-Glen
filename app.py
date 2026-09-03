@@ -32,7 +32,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-APP_VERSION = "15.18-management-mis"
+APP_VERSION = "15.21-task-state-sync"
 
 st.set_page_config(
     page_title="E-Commerce Reconciliation Control Tower",
@@ -1396,8 +1396,27 @@ def amazon_payment_enrichment(path):
         if pdate:
             x["__pdate__"] = pd.to_datetime(x[pdate], errors="coerce")
             x["__refund_date__"] = x["__pdate__"].where(x["__refund_flag__"])
+
+            # Payment Received Date must represent only a genuine payment receipt.
+            # Refund/reversal/adjustment dates must never overwrite it.
+            # Use the first positive released payment receipt date for the order.
+            if adjustment_type_col is not None:
+                __adj_date_flag__ = (
+                    x[adjustment_type_col].fillna("").astype(str)
+                    .str.strip().str.casefold().eq("adjustment")
+                )
+            else:
+                __adj_date_flag__ = pd.Series(False, index=x.index)
+
+            __payment_date_flag__ = (
+                (~x["__refund_flag__"])
+                & (~__adj_date_flag__)
+                & (x["__amount__"] > 0.000001)
+            )
+            x["__payment_date__"] = x["__pdate__"].where(__payment_date_flag__)
         else:
             x["__pdate__"] = pd.NaT
+            x["__payment_date__"] = pd.NaT
             x["__refund_date__"] = pd.NaT
 
         # Numeric/date aggregation is now done by pandas in a few groupby calls.
@@ -1406,7 +1425,7 @@ def amazon_payment_enrichment(path):
             refund=("__refund_amount__", "sum"),
             adjustment=("__adjustment__", "sum"),
             total_deductions=("__deductions__", "sum"),
-            payment_date=("__pdate__", "max"),
+            payment_date=("__payment_date__", "min"),
             refund_date=("__refund_date__", "max"),
         )
 
@@ -1488,7 +1507,8 @@ def amazon_payment_enrichment(path):
         if refs:
             dest["payment_reference"] = " | ".join(dict.fromkeys(refs))
         if dates:
-            dest["payment_date"] = max(dates)
+            # Preserve the first genuine receipt date across original/replacement IDs.
+            dest["payment_date"] = min(dates)
         if refund_dates:
             dest["refund_date"] = max(refund_dates)
 
@@ -1687,12 +1707,20 @@ def flipkart_payment_enrichment(path):
                 if col: total += float(pd.to_numeric(g[col],errors="coerce").fillna(0).abs().sum())
             d["total_deductions"]=total
             if pdate:
-                ds=pd.to_datetime(g[pdate],errors="coerce").dropna()
-                if not ds.empty:
-                    d["payment_date"]=ds.max().date().isoformat()
-                    refund_mask=pd.to_numeric(g[refund],errors="coerce").fillna(0).abs()>1 if refund else pd.Series(False,index=g.index)
-                    rds=pd.to_datetime(g.loc[refund_mask,pdate],errors="coerce").dropna()
-                    if not rds.empty: d["refund_date"]=rds.max().date().isoformat()
+                # Payment Received Date must reflect an actual positive receipt only.
+                # Refund/reimbursement/adjustment rows must never overwrite it.
+                if received:
+                    receipt_mask = pd.to_numeric(
+                        g[received], errors="coerce"
+                    ).fillna(0) > 0.000001
+                    receipt_dates = pd.to_datetime(
+                        g.loc[receipt_mask, pdate], errors="coerce"
+                    ).dropna()
+                    if not receipt_dates.empty:
+                        d["payment_date"] = receipt_dates.min().date().isoformat()
+                refund_mask=pd.to_numeric(g[refund],errors="coerce").fillna(0).abs()>1 if refund else pd.Series(False,index=g.index)
+                rds=pd.to_datetime(g.loc[refund_mask,pdate],errors="coerce").dropna()
+                if not rds.empty: d["refund_date"]=rds.max().date().isoformat()
             if neft: d["payment_reference"]=" | ".join(dict.fromkeys([txt(v) for v in g[neft] if txt(v)]))
             if neft_type: d["payment_transaction_status"]=" | ".join(dict.fromkeys([txt(v) for v in g[neft_type] if txt(v)]))
     except Exception: pass
@@ -2859,6 +2887,94 @@ def operational_history_counts(portal):
     }
 
 
+AUTO_TASK_REMARKS = {
+    "auto-completed because pending remarks changed to reconciled",
+    "auto-closed: return received; no billing/payment was created",
+}
+
+
+def sync_pending_task_state_with_master(portal=None):
+    """
+    Keep source-derived Pending Remarks and operational task state consistent.
+
+    Rules:
+    - Current Pending Remarks is the source of truth for whether an auto-completed
+      task should still be active.
+    - Only system-generated auto-completion text is removed/reopened; manual team
+      remarks and manually completed task history are preserved.
+    - Reconciled orders are handled by complete_tasks_for_reconciled_orders().
+
+    Returns the number of stale auto-completed task rows repaired.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with db() as c:
+        if portal:
+            master_rows = c.execute("""
+                SELECT portal,order_no,pending_remarks
+                FROM reconciliation_master
+                WHERE portal=?
+            """, (portal,)).fetchall()
+            task_rows = c.execute("""
+                SELECT portal,order_no,task_type,task_status,
+                       task_completed_date,team_remarks
+                FROM pending_tasks
+                WHERE portal=?
+            """, (portal,)).fetchall()
+        else:
+            master_rows = c.execute("""
+                SELECT portal,order_no,pending_remarks
+                FROM reconciliation_master
+            """).fetchall()
+            task_rows = c.execute("""
+                SELECT portal,order_no,task_type,task_status,
+                       task_completed_date,team_remarks
+                FROM pending_tasks
+            """).fetchall()
+
+        current_task = {}
+        for p, order_no, remark in master_rows:
+            p = txt(p)
+            order_no = clean_id(order_no)
+            task_type = task_type_from_remark(remark)
+            if p and order_no and task_type:
+                current_task[(p, order_no)] = task_type
+
+        repairs = []
+        for p, order_no, task_type, status, completed_date, team_remarks in task_rows:
+            p = txt(p)
+            order_no = clean_id(order_no)
+            task_type = txt(task_type)
+            expected = current_task.get((p, order_no), "")
+            if not expected or expected != task_type:
+                continue
+
+            remark_norm = txt(team_remarks).strip().casefold()
+            if remark_norm not in AUTO_TASK_REMARKS:
+                continue
+
+            # This task was auto-completed when the order was Reconciled, but the
+            # current source now says the exact task is pending again. Re-open only
+            # the system-generated completion; never erase a human remark.
+            new_status = "Pending" if txt(status).strip().casefold() == "completed" else txt(status) or "Pending"
+            repairs.append((new_status, now, p, order_no, task_type))
+
+        if repairs:
+            c.executemany("""
+                UPDATE pending_tasks
+                SET task_status=?,
+                    task_completed_date=NULL,
+                    team_remarks='',
+                    last_update=?
+                WHERE portal=? AND order_no=? AND task_type=?
+            """, repairs)
+            c.commit()
+
+    if repairs:
+        invalidate_read_cache()
+    return len(repairs)
+
+
 def upsert_reconciliation(frame, source_file, record_upload=True):
     """
     Bulk-save one complete portal snapshot while preserving operational history.
@@ -2878,6 +2994,9 @@ def upsert_reconciliation(frame, source_file, record_upload=True):
     return_qty = pd.to_numeric(
         frame.get("courier_customer_return_qty", 0), errors="coerce"
     ).fillna(0).abs()
+    order_qty = pd.to_numeric(
+        frame.get("order_qty", 0), errors="coerce"
+    ).fillna(0).abs()
     return_delivered = pd.to_datetime(
         frame.get("return_completed_date"), errors="coerce"
     ).notna()
@@ -2893,6 +3012,27 @@ def upsert_reconciliation(frame, source_file, record_upload=True):
     refund = pd.to_numeric(
         frame.get("refund", 0), errors="coerce"
     ).fillna(0)
+
+    # v15.19 partial-return financial closure:
+    # When only part of a multi-quantity order is returned, the returned quantity
+    # is already financially closed by a refund and payment has been received for
+    # the balance quantity, the order is fully reconciled. A missing CN must not
+    # force the whole order to remain "CN Pending" in this specific quantity-split
+    # scenario.
+    portal_series = frame.get(
+        "portal", pd.Series("", index=frame.index)
+    ).fillna("").astype(str).str.strip().str.casefold()
+    partial_return_paid_balance = (
+        portal_series.isin(["amazon", "flipkart"])
+        & order_qty.gt(1.000001)
+        & return_qty.gt(0.000001)
+        & (return_qty + 0.000001 < order_qty)
+        & received.gt(0.000001)
+        & refund.abs().gt(0.000001)
+        & (invoice_qty + 0.000001 >= order_qty)
+    )
+    frame.loc[partial_return_paid_balance, "pending_remarks"] = "Reconciled"
+    frame.loc[partial_return_paid_balance, "transaction_status"] = "Reconciled"
 
     returned_unbilled_no_payment = (
         (return_qty > 0.000001)
@@ -3095,6 +3235,11 @@ def upsert_reconciliation(frame, source_file, record_upload=True):
                 for portal, order_no in reconciled_keys
             ])
             c.commit()
+
+    # If an order was auto-completed on an earlier source snapshot but the
+    # latest source now carries a pending remark again, reopen only the stale
+    # system-generated task state. Manual team remarks/completions are preserved.
+    sync_pending_task_state_with_master(portal_snapshot)
 
     # Verify that the cloud snapshot contains the expected row count before
     # reporting success to the UI.
@@ -5365,9 +5510,6 @@ def complete_tasks_for_reconciled_orders():
     return int(active_before or 0)
 
 
-complete_tasks_for_reconciled_orders()
-
-
 @st.cache_resource(show_spinner=False)
 def backfill_missing_tasks_from_master():
     """
@@ -5446,12 +5588,14 @@ def run_deferred_maintenance():
     repaired_payment = repair_payment_status_consistency()
     repaired_returns = repair_returned_unbilled_no_payment()
     completed = complete_tasks_for_reconciled_orders()
+    reopened = sync_pending_task_state_with_master()
     backfilled = backfill_missing_tasks_from_master()
     invalidate_read_cache()
     return {
         "payment_repairs": int(repaired_payment or 0),
         "return_repairs": int(repaired_returns or 0),
         "tasks_completed": int(completed or 0),
+        "tasks_reopened": int(reopened or 0),
         "tasks_backfilled": int(backfilled or 0),
     }
 
