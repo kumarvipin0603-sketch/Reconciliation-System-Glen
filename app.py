@@ -3281,7 +3281,7 @@ def load_tasks():
         return t
 
     # Dates + aging are fully vectorized.
-    for col in ["task_created_date","working_date","task_completed_date","last_update"]:
+    for col in ["task_created_date","working_date","task_completed_date","raised_date","last_update"]:
         if col in t.columns:
             t[col] = pd.to_datetime(t[col], errors="coerce")
 
@@ -3787,13 +3787,25 @@ def _fast_dashboard_operational_overlay(master):
     # ---- Task overlay: aggregate only the ~task-table rows, not the master.
     if not tasks.empty:
         def _join_unique_fast(series):
-            vals = (
-                series.fillna("")
-                .astype(str)
-                .str.strip()
-            )
-            vals = vals[(vals != "") & (vals.str.lower() != "nan")]
-            return " | ".join(dict.fromkeys(vals.tolist()))
+            out = []
+            for value in series:
+                if value is None:
+                    continue
+
+                try:
+                    if pd.isna(value):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+                value = str(value).strip()
+                if not value or value.lower() in {"nan", "none", "nat"}:
+                    continue
+
+                if value not in out:
+                    out.append(value)
+
+            return " | ".join(out)
 
         def _task_status_fast(series):
             vals = (
