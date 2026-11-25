@@ -183,8 +183,9 @@ def get_remarks(row: pd.Series) -> str:
     2. Refund/negative settlement without a full CN remains CN Pending.
     3. Positive receipt of 50% or less is Short Payment Received, except
        unresolved replacement cases where the CN is still pending.
-    4. Positive receipt above 50% of Net Sale Item Price is Reconciled.
-    5. Operational return without a posted sales return remains CN Pending
+    4. Released partial refund with an outstanding balance overrides closure.
+    5. Otherwise positive receipt above 50% of Net Sale Item Price is Reconciled.
+    6. Operational return without a posted sales return remains CN Pending
        only when the payment threshold has not been crossed.
     """
     payment = round(float(row["Rece Amount"]), 2)
@@ -245,6 +246,13 @@ def get_remarks(row: pd.Series) -> str:
     # A refund/reversal exists but the credit note has not been fully processed.
     if has_sale and payment_refunded:
         return "CN Pending"
+
+    # A positive net settlement can still contain a released partial refund.
+    # Rece Amount is already net of refunds; do not deduct them twice.
+    if (has_sale and payment_received
+        and abs(float(row.get("Released Refund Amount", 0) or 0)) > AMOUNT_TOLERANCE
+        and billed_amount - payment > AMOUNT_TOLERANCE):
+        return "Short Payment Received"
 
     # Reviewed replacement cases: where no CN is posted against the replacement
     # billing, a receipt of 50% or less still represents CN Pending.
@@ -504,6 +512,8 @@ def process_reconciliation(
     ].copy()
 
     payment_dict = released.groupby("Order ID")["Rece Amount"].sum().to_dict()
+    refund_mask = released["Type"].fillna("").astype(str).str.contains("refund|reversal", case=False, na=False)
+    refund_dict = released.loc[refund_mask].groupby("Order ID")["Rece Amount"].sum().to_dict()
     deferred_dict = deferred.groupby("Order ID")["Rece Amount"].sum().to_dict()
 
     # ---------- Reimbursements ----------
@@ -529,6 +539,7 @@ def process_reconciliation(
         return_qty = 0.0
         net_sale_amount = 0.0
         received_amount = 0.0
+        released_refund_amount = 0.0
         deferred_amount = 0.0
         reimbursement_amount = 0.0
         reimbursement_reasons: list[str] = []
@@ -554,6 +565,7 @@ def process_reconciliation(
 
             # Roll both RELEASED and DEFERRED across original + replacement IDs.
             received_amount += float(payment_dict.get(order_id, 0.0))
+            released_refund_amount += float(refund_dict.get(order_id, 0.0))
             deferred_amount += float(deferred_dict.get(order_id, 0.0))
 
             reimb_data = reimbursement_dict.get(order_id)
@@ -570,6 +582,7 @@ def process_reconciliation(
                 "Return Qty": return_qty,
                 "Net Sale Item Price": net_sale_amount,
                 "Rece Amount": received_amount,
+                "Released Refund Amount": released_refund_amount,
                 "Deferred Amount": deferred_amount,
                 "Reimbursement Amount": reimbursement_amount,
                 "Reason": unique_join(reimbursement_reasons),

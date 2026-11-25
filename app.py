@@ -32,7 +32,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-APP_VERSION = "15.21-task-state-sync"
+APP_VERSION = "15.23-partial-refund-short-payment"
 
 st.set_page_config(
     page_title="E-Commerce Reconciliation Control Tower",
@@ -4353,8 +4353,28 @@ def apply_global_filters(df, prefix):
         view = view[view["Task Status"].fillna("").astype(str).apply(
             lambda s: any(x == part.strip() for x in ts for part in s.split("|"))
         )]
-    if oid and "Order No" in view.columns:
-        view = view[view["Order No"].astype(str).str.contains(oid,case=False,na=False)]
+    if oid:
+        # Search original IDs and linked replacement IDs in every dashboard.
+        # Replacement IDs may be pipe-separated (one original, many replacements).
+        query = oid.strip().casefold()
+        if query:
+            matched = pd.Series(False, index=view.index)
+            for column in ("Order No", "Replacement Order Id", "Replacement Order"):
+                if column not in view.columns:
+                    continue
+                values = view[column].fillna("").astype(str)
+                if column == "Order No":
+                    matched |= values.str.casefold().str.contains(
+                        query, regex=False, na=False
+                    )
+                else:
+                    matched |= values.map(
+                        lambda value: any(
+                            query in part.strip().casefold()
+                            for part in value.split("|")
+                        )
+                    )
+            view = view.loc[matched]
 
     return view
 
@@ -5323,12 +5343,13 @@ def repair_payment_status_consistency():
         rows = c.execute("""
             SELECT portal,order_no,order_status,net_pay_received,invoice_qty,
                    refund,reimbursement,pending_remarks,payment_status,
-                   transaction_status
+                   transaction_status,invoice_price,cn_price,cn_qty
             FROM reconciliation_master
         """).fetchall()
 
         for (portal, order_no, order_status, received, invoice_qty, refund,
-             reimbursement, remark, old_payment_status, old_transaction_status) in rows:
+             reimbursement, remark, old_payment_status, old_transaction_status,
+             invoice_price, cn_price, cn_qty) in rows:
             received_num = num(received)
             remark_txt = txt(remark)
             new_payment_status = payment_status_from_amount(received_num, remark_txt)
@@ -5358,6 +5379,19 @@ def repair_payment_status_consistency():
                 else:
                     new_remark = "Billing & Payment Pending"
                 new_transaction_status = new_remark
+
+            # Repair saved Amazon orders closed by the old >50% rule.
+            if (
+                txt(portal).casefold() == "amazon"
+                and remark_txt.lower().startswith("reconciled")
+                and num(invoice_qty) - num(cn_qty) > 0.000001
+                and abs(num(refund)) > amazon_engine.AMOUNT_TOLERANCE
+                and received_num > amazon_engine.AMOUNT_TOLERANCE
+                and abs(num(invoice_price)) - abs(num(cn_price)) - received_num > amazon_engine.AMOUNT_TOLERANCE
+            ):
+                new_remark = "Short Payment Received"
+                new_transaction_status = new_remark
+                new_payment_status = payment_status_from_amount(received_num, new_remark)
 
             if not new_transaction_status:
                 new_transaction_status = settlement_status_from_remark(
@@ -5601,6 +5635,7 @@ def run_deferred_maintenance():
     repaired_returns = repair_returned_unbilled_no_payment()
     completed = complete_tasks_for_reconciled_orders()
     reopened = sync_pending_task_state_with_master()
+    backfill_missing_tasks_from_master.clear()
     backfilled = backfill_missing_tasks_from_master()
     invalidate_read_cache()
     return {
